@@ -169,7 +169,7 @@ pids = [int(f) for f in os.listdir('/proc') if f.isdigit()]
 for pid in pids:
     try:
         procs[pid] = get_proc_io_counters(pid)['wchar']
-    except IOError:
+    except FileNotFoundError:
         pass
 
 content = fanotify(FAN_CLASS_PRE_CONTENT | FAN_UNLIMITED_QUEUE)
