@@ -140,8 +140,11 @@ class fanotify:
 
     def __iter__(self):
         while 1:
-            for fa_event in struct.iter_unpack('IBxHQii', self.read()):
-                yield fanotify_event_metadata(*fa_event)
+            for fa_metadata in struct.iter_unpack('IBxHQii', self.read()):
+                fa_event = fanotify_event_metadata(*fa_metadata)
+                if fa_event.vers != FANOTIFY_METADATA_VERSION:
+                    raise OSError('Mismatch of fanotify metadata version')
+                yield fa_event
 
     def mark(self, flags, mask, dirfd=AT_FDCWD, pathname=ffi.NULL):
         if isinstance(pathname, str):
@@ -193,9 +196,6 @@ signal.alarm(args.s)
 
 with content:
     for fa_event in content:
-        if fa_event.vers != FANOTIFY_METADATA_VERSION:
-            raise OSError('Mismatch of fanotify metadata version')
-
         curr_wchar = get_proc_io_counters(fa_event.pid)['wchar']
         prev_wchar = procs.get(fa_event.pid)
 
