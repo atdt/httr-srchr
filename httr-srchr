@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+  httr-srchr
+  ~~~~~~~~~~
+  httr-srchr tells you where IO is happening in your filesystem.
+
+
+  usage: httr-srchr [-h] [-s SECONDS] [-n NUM]
+
+  optional arguments:
+   -h            print this help message and exit
+   -s SECONDS    seconds to spend watching io (default: 5)
+   -n NUM        number of results to display (default: 3)
+
+
+  Copyright 2016 Ori Livneh <ori@wikimedia.org>
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+"""
+import argparse
+import collections
+import contextlib
+import errno
+import operator
+import os
+import signal
+import struct
+import sys
+
+try:
+    import cffi
+except ImportError:
+    sys.exit('httr-srchr requires cffi (python3-cffi)')
+
+
+# defined in fcntl.h:
+AT_FDCWD = -100
+
+# defined in fanotify.h:
+FAN_CLASS_PRE_CONTENT = 0x00000008
+FAN_UNLIMITED_QUEUE = 0x00000010
+FAN_CLOSE_WRITE = 0x8
+FAN_MARK_ADD = 0x00000001
+FAN_MARK_MOUNT = 0x00000010
+FAN_MODIFY = 0x00000002
+FAN_EVENT_METADATA_LEN = 24
+FANOTIFY_METADATA_VERSION = 3
+
+
+ap = argparse.ArgumentParser(
+        description='see where IO is happening in your filesystem')
+ap.add_argument('-s', type=int, default=5,
+                help='seconds to spend watching io (default: 5)')
+ap.add_argument('-n', type=int, default=3,
+                help='number of results to display (default: 3)')
+args = ap.parse_args()
+
+ffi = cffi.FFI()
+
+ffi.cdef('''
+    /* from fanotify_init(2) man page */
+    int fanotify_init(unsigned int flags, unsigned int event_f_flags);
+    int fanotify_mark(int fanotify_fd, unsigned int flags,
+                      uint64_t mask, int dirfd, const char *pathname);
+
+    /* from getmntent(3) man page */
+    struct mntent {
+        char *mnt_fsname;   /* name of mounted file system */
+        char *mnt_dir;      /* file system path prefix */
+        char *mnt_type;     /* mount type (see mntent.h) */
+        char *mnt_opts;     /* mount options (see mntent.h) */
+        int   mnt_freq;     /* dump frequency in days */
+        int   mnt_passno;   /* pass number on parallel fsck */
+    };
+
+    FILE *setmntent(const char *filename, const char *type);
+    struct mntent *getmntent(FILE *fp);
+    int endmntent(FILE *fp);
+''')
+C = ffi.dlopen(None)
+
+
+def get_proc_io_counters(pid='self'):
+    """Read I/O counters from /proc/NNN/io and return as dict."""
+    with open('/proc/%s/io' % pid) as f:
+        raw = (line.strip().split(': ') for line in f)
+        return {k: int(v) for k, v in raw}
+
+
+def get_mount_points():
+    """Get all mountpoints from /proc/mounts and return as list of dicts."""
+    f = C.setmntent(b'/proc/mounts', b'r')
+    if f == ffi.NULL:
+        raise OSError('setmntent')
+    mounts = []
+    while 1:
+        ent = C.getmntent(f)
+        if ent == ffi.NULL:
+            break
+        mounts.append({
+            'fsname': ffi.string(ent.mnt_fsname),
+            'dir': ffi.string(ent.mnt_dir),
+            'type': ffi.string(ent.mnt_type),
+            'opts': ffi.string(ent.mnt_opts),
+        })
+    C.endmntent(f)
+    return mounts
+
+
+fanotify_event_metadata = collections.namedtuple(
+    'fanotify_event_metadata', 'event_len vers metadata_len mask fd pid')
+
+
+class fanotify:
+    """Represents a fanotify notification group."""
+
+    def __init__(self, flags, event_f_flags=os.O_RDONLY | os.O_CLOEXEC):
+        self.flags = flags
+        self.fd = C.fanotify_init(flags, event_f_flags)
+        if self.fd == -1:
+            raise OSError(ffi.errno, 'fanotify_init')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __iter__(self):
+        while 1:
+            for fa_event in struct.iter_unpack('IBxHQii', self.read()):
+                yield fanotify_event_metadata(*fa_event)
+
+    def mark(self, flags, mask, dirfd=AT_FDCWD, pathname=ffi.NULL):
+        if isinstance(pathname, str):
+            pathname = pathname.encode('utf-8')
+        result = C.fanotify_mark(self.fd, flags, mask, dirfd, pathname)
+        if result != 0:
+            raise OSError(ffi.errno, 'fanotify_mark')
+
+    def read(self, size=FAN_EVENT_METADATA_LEN * 1000):
+        return os.read(self.fd, size)
+
+    def close(self):
+        fd, self.fd = self.fd, None
+        if fd is not None:
+            os.close(fd)
+
+    def fileno(self):
+        return self.fd
+
+
+files = {}
+
+procs = {}
+pids = [int(f) for f in os.listdir('/proc') if f.isdigit()]
+for pid in pids:
+    try:
+        procs[pid] = get_proc_io_counters(pid)['wchar']
+    except IOError:
+        pass
+
+content = fanotify(FAN_CLASS_PRE_CONTENT | FAN_UNLIMITED_QUEUE)
+
+for mount in get_mount_points():
+    if mount['fsname'].startswith(b'/dev/disk'):
+        content.mark(FAN_MARK_ADD | FAN_MARK_MOUNT,
+                     FAN_CLOSE_WRITE | FAN_MODIFY,
+                     pathname=mount['dir'])
+
+
+def handler(signum, frame):
+    changes = list(files.items())
+    changes.sort(key=operator.itemgetter(1), reverse=True)
+    for filename, change in changes[:args.n]:
+        print('%s %.2f kB' % (filename, change / 1024))
+    sys.exit(0)
+
+signal.signal(signal.SIGALRM, handler)
+signal.alarm(args.s)
+
+with content:
+    for fa_event in content:
+        if fa_event.vers != FANOTIFY_METADATA_VERSION:
+            raise OSError('Mismatch of fanotify metadata version')
+
+        curr_wchar = get_proc_io_counters(fa_event.pid)['wchar']
+        prev_wchar = procs.get(fa_event.pid)
+
+        if prev_wchar is not None:
+            file_path = os.readlink('/proc/self/fd/%d' % fa_event.fd)
+            files[file_path] = (files.get(file_path, 0) +
+                                (curr_wchar - prev_wchar))
+
+        procs[fa_event.pid] = curr_wchar
+        os.close(fa_event.fd)
